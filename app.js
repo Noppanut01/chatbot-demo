@@ -30,6 +30,24 @@ function isValidSignature(req) {
   return hash === signature;
 }
 
+// In a group/room, LINE marks the mentionee with isSelf: true when the bot
+// itself is tagged — that's how we tell "someone @mentioned the bot" apart
+// from an ordinary message or an @mention of another member.
+function isBotMentioned(message) {
+  return Boolean(message.mention?.mentionees?.some((m) => m.isSelf));
+}
+
+// Strip the "@BotName" text out before sending it to Gemini, so the model
+// answers the actual question instead of reacting to the mention itself.
+function stripSelfMentions(message) {
+  const selfRanges = (message.mention?.mentionees || []).filter((m) => m.isSelf);
+  let text = message.text;
+  for (const { index, length } of [...selfRanges].sort((a, b) => b.index - a.index)) {
+    text = text.slice(0, index) + text.slice(index + length);
+  }
+  return text.trim();
+}
+
 async function getReplyText(userMessage) {
   const interaction = await ai.interactions.create({
     model: "gemini-2.5-flash",
@@ -70,13 +88,23 @@ app.post("/webhook", async (req, res) => {
   // every reply must finish before we respond — no fire-and-forget here.
   const events = req.body.events || [];
   for (const event of events) {
-    if (event.type === "message" && event.message.type === "text") {
-      const replyText = await getReplyText(event.message.text);
-      try {
-        await replyToLine(event.replyToken, replyText);
-      } catch (err) {
-        console.error("LINE reply failed:", err.response?.data || err.message);
-      }
+    if (event.type !== "message" || event.message.type !== "text") continue;
+
+    const isGroupOrRoom = event.source.type === "group" || event.source.type === "room";
+    // In 1-on-1 chat every message is meant for the bot; in a group/room
+    // only reply when someone actually @mentions it, to avoid spamming
+    // everyone else's messages.
+    if (isGroupOrRoom && !isBotMentioned(event.message)) continue;
+
+    const userText = isGroupOrRoom
+      ? stripSelfMentions(event.message)
+      : event.message.text;
+
+    const replyText = await getReplyText(userText);
+    try {
+      await replyToLine(event.replyToken, replyText);
+    } catch (err) {
+      console.error("LINE reply failed:", err.response?.data || err.message);
     }
   }
 
